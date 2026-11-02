@@ -83,6 +83,8 @@ pub struct Server {
     /// Rebuilt when a config file changes, with or without symbols.
     pub configs: ConfigIndex,
     pub symbols_path: Option<PathBuf>,
+    /// `configWarnings: false`: config-file problems are not reported.
+    pub mute_config: bool,
     symbols: Option<(SystemTime, IndexMap<String, CompilerTypeInfo>)>,
     pub state: Option<State>,
     parses: HashMap<PathBuf, Parse>,
@@ -210,7 +212,9 @@ impl Server {
         if parse.is_none_or(|p| p.current) {
             out.extend(self.state.as_ref().and_then(|st| st.script_diags.get(path)).into_iter().flatten().cloned());
         }
-        out.extend(self.configs.diagnostics.get(path).into_iter().flatten().cloned());
+        if !self.mute_config {
+            out.extend(self.configs.diagnostics.get(path).into_iter().flatten().cloned());
+        }
         out
     }
 

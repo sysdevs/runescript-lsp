@@ -289,6 +289,11 @@ fn config_diagnostics() {
             (4, "`cost` takes a number".into()),
         ]
     );
+    // configWarnings off: the next pass clears them (an empty list for the file)
+    s.mute_config = true;
+    s.request_full();
+    let cycle = s.analyze();
+    assert!(cycle.diagnostics.iter().any(|(p, d)| p == &obj && d.is_empty()));
 }
 
 #[test]

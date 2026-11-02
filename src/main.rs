@@ -1,6 +1,6 @@
 //! `runescript-lsp`: the RuneScript language server, over stdio.
 //! Settings arrive as `initializationOptions` / `workspace/didChangeConfiguration`
-//! (`{ "symbolsPath": "..." }`, also accepted nested under `runescript`).
+//! (`{ "symbolsPath": "...", "configWarnings": true }`, also accepted nested under `runescript`).
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -19,6 +19,12 @@ const DEBOUNCE: Duration = Duration::from_millis(100);
 fn symbols_path(settings: &serde_json::Value) -> Option<PathBuf> {
     let v = settings.get("runescript").unwrap_or(settings);
     v.get("symbolsPath").and_then(|p| p.as_str()).filter(|p| !p.is_empty()).map(PathBuf::from)
+}
+
+/// `configWarnings` (default true) turned off.
+fn mute_config(settings: &serde_json::Value) -> bool {
+    let v = settings.get("runescript").unwrap_or(settings);
+    v.get("configWarnings").and_then(|w| w.as_bool()) == Some(false)
 }
 
 fn path(uri: &Url) -> PathBuf {
@@ -60,6 +66,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
         _ => Vec::new(),
     };
     let mut server = Server::new(&roots, init.initialization_options.as_ref().and_then(symbols_path));
+    server.mute_config = init.initialization_options.as_ref().is_some_and(mute_config);
     let refresh_hints = init.capabilities.workspace.as_ref().and_then(|w| w.inlay_hint.as_ref()).and_then(|i| i.refresh_support) == Some(true);
     let mut last_warning = None;
     // Edits to script bodies are re-checked right here (milliseconds); full passes
@@ -199,6 +206,7 @@ fn notification(server: &mut Server, note: Notification) -> bool {
         n::DidChangeConfiguration::METHOD => {
             let Ok(p) = serde_json::from_value::<DidChangeConfigurationParams>(params) else { return false };
             server.symbols_path = symbols_path(&p.settings);
+            server.mute_config = mute_config(&p.settings);
             server.request_full();
             true
         }
