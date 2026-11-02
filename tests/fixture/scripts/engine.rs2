@@ -1,0 +1,6 @@
+// info: Sends a message to the player's chatbox.
+[command,mes](string $text)
+[command,tostring](int $value)(string)
+[command,random](int $max)(int)
+[command,npc_find](coord $coord, npc $npc)(boolean)
+[command,inv_total](inv $inv, obj $obj)(int)

@@ -1,0 +1,13 @@
+[proc,greet](int $times)(string)
+def_int $count = random(^max_level);
+def_npc $who = man;
+mes("hi <tostring($count)>");
+if (npc_find(^spawn, $who) = true) {
+    mes(tostring(inv_total(inv, coins)));
+}
+return("done");
+
+[label,farewell](int $total)
+mes(tostring(%playtime));
+mes(~greet(1));
+@farewell($total);

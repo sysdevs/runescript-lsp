@@ -1,0 +1,7 @@
+[coins]
+name=Coins
+category=humans
+
+[bronze_sword]
+name=Bronze sword
+certlink=coins
