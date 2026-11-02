@@ -372,8 +372,8 @@ fn rename_config_through_values() {
     assert_eq!(got, [("items.obj".into(), 0), ("items.obj".into(), 6), ("main.rs2".into(), 5), ("obj.pack".into(), 0)]);
 }
 
-/// A throwaway workspace with one interface `test` (components layer0, com0, other), its pack
-/// lines and a script using `test:com0`; symbols are 07-commands plus component/interface tables.
+/// A throwaway workspace with one interface `test` (components layer0, com0, other, and fresh,
+/// which only the pack knows), its pack lines and a script using `test:com0`; symbols are 07-commands plus component/interface tables.
 fn interface_workspace() -> (Server, PathBuf) {
     let dir = std::env::temp_dir().join(format!("rs-lsp-component-rename-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -382,9 +382,9 @@ fn interface_workspace() -> (Server, PathBuf) {
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(&p, text).unwrap();
     };
-    write("scripts/test/interfaces/test.if", "[layer0]\ntype=layer\n\n[com0]\ntype=graphic\nlayer=layer0\noverlayer=layer0\n\n[other]\ntype=rect\nscript1op1=inv_count,test:com0,coins\n");
+    write("scripts/test/interfaces/test.if", "[layer0]\ntype=layer\n\n[com0]\ntype=graphic\nlayer=layer0\noverlayer=layer0\n\n[other]\ntype=rect\nscript1op1=inv_count,test:com0,coins\n\n[fresh]\ntype=rect\n");
     write("scripts/test/scripts/test.rs2", "[if_button,test:com0]\nreturn;\n");
-    write("pack/interface.pack", "0=test\n1=test:layer0\n2=test:com0\n3=test:other\n");
+    write("pack/interface.pack", "0=test\n1=test:layer0\n2=test:com0\n3=test:other\n4=test:fresh\n");
     let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../ares-compiler/tests/fixtures/07-commands/symbols.json");
     let mut symbols: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(base).unwrap()).unwrap();
     let table = |names: &[(&str, &str)]| {
@@ -446,6 +446,17 @@ fn component_rename() {
             ("test.if".into(), 5, 6, "frame".into()),
             ("test.if".into(), 6, 10, "frame".into()),
         ]
+    );
+    // the same renames start from a `layer=` value or a script operand
+    let header = rename_edits(&s, &iface, Position { line: 0, character: 2 }, "frame");
+    assert_eq!(rename_edits(&s, &iface, Position { line: 5, character: 8 }, "frame"), header);
+    let header = rename_edits(&s, &iface, Position { line: 3, character: 2 }, "pic");
+    assert_eq!(rename_edits(&s, &iface, Position { line: 10, character: 24 }, "pic"), header);
+    assert!(s.prepare_rename(&iface, Position { line: 4, character: 2 }).is_err(), "keys are not components");
+    // a component newer than symbols.json is known from interface.pack
+    assert_eq!(
+        rename_edits(&s, &iface, Position { line: 12, character: 2 }, "new"),
+        [("interface.pack".into(), 4, 2, "test:new".into()), ("test.if".into(), 12, 1, "new".into())]
     );
 }
 

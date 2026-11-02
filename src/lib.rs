@@ -346,7 +346,21 @@ impl Job {
 
         let mut state = None;
         if let Some((_, symbols)) = &self.symbols {
-            let config = ares_compiler::Config { symbols: symbols.clone(), ..Default::default() };
+            let mut symbols = symbols.clone();
+            // Interfaces and components added since the last `symbols.json` come from the workspace's `interface.pack`.
+            for (_, text) in files.iter().filter(|(p, _)| p.file_name().is_some_and(|f| f == "interface.pack")) {
+                for (id, n) in text.lines().filter_map(|l| l.split_once('=')) {
+                    let Ok(num) = id.parse::<i32>() else { continue };
+                    for t in ["interface", "component"] {
+                        let Some(table) = symbols.get_mut(t) else { continue };
+                        if !table.map.contains_key(id) {
+                            table.map.insert(id.to_owned(), n.trim_end().to_owned());
+                            table.max = table.max.max(num);
+                        }
+                    }
+                }
+            }
+            let config = ares_compiler::Config { symbols, ..Default::default() };
             let result = if has_macros {
                 ares_compiler::analyze(&config, &sources)
             } else {

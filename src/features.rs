@@ -561,13 +561,19 @@ impl Server {
             Some(r) => (r.name.clone(), pack_ext(r.pack)),
             None => {
                 let line = self.vfs.text(path)?.lines().nth(p.line as usize)?.trim_end();
-                let name = line.strip_prefix('[')?.strip_suffix(']')?;
-                // `.if` headers name components, which are `iface:com` symbols
+                let header = line.strip_prefix('[').and_then(|l| l.strip_suffix(']'));
                 if ext(path) == "if" {
+                    // `.if` headers and `layer=` / `overlayer=` values name components of this file by
+                    // their short name; script operands such as `inv_count,iface:com,obj` by the full one
                     let stem = path.file_stem()?.to_str()?.to_lowercase();
-                    (format!("{stem}:{name}"), ext(path))
+                    let name = match header {
+                        Some(name) => name.to_owned(),
+                        None if line.find('=').is_some_and(|eq| (eq as u32) < p.character) => word_at(self, path, p)?.1,
+                        None => return None,
+                    };
+                    (if name.contains(':') { name } else { format!("{stem}:{name}") }, ext(path))
                 } else {
-                    (name.to_owned(), ext(path))
+                    (header?.to_owned(), ext(path))
                 }
             }
         };
