@@ -4,20 +4,21 @@
 //!
 //! An edit to a script body is re-checked alone on the main thread
 //! ([`Server::update`], milliseconds). Anything else (start-up, save, changed
-//! script headers, new or deleted scripts, a new `symbols.json`) takes a full
-//! pass off the main thread: [`Server::snapshot`], [`Job::run`], [`Server::install`].
-//! A full pass parses only scripts whose text changed.
+//! script headers, new or deleted scripts, a config edit that changes the
+//! symbol tables) takes a full pass off the main thread: [`Server::snapshot`],
+//! [`Job::run`], [`Server::install`]. A full pass parses only scripts whose text
+//! changed. The symbol tables come from the workspace itself ([`symbols::tables`]).
 
 pub mod config_keys;
 pub mod configs;
 pub mod features;
 pub mod index;
 pub mod pos;
+pub mod symbols;
 pub mod vfs;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 
 use indexmap::IndexMap;
 use lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString};
@@ -82,10 +83,10 @@ pub struct Server {
     roots: Vec<PathBuf>,
     /// Rebuilt when a config file changes, with or without symbols.
     pub configs: ConfigIndex,
-    pub symbols_path: Option<PathBuf>,
     /// `configWarnings: false`: config-file problems are not reported.
     pub mute_config: bool,
-    symbols: Option<(SystemTime, IndexMap<String, CompilerTypeInfo>)>,
+    /// The symbol tables the last full pass used.
+    symbols: IndexMap<String, CompilerTypeInfo>,
     pub state: Option<State>,
     parses: HashMap<PathBuf, Parse>,
     has_macros: bool,
@@ -112,8 +113,8 @@ pub struct Cycle {
 }
 
 impl Server {
-    pub fn new(roots: &[PathBuf], symbols_path: Option<PathBuf>) -> Self {
-        Server { vfs: Vfs::load(roots), roots: roots.to_vec(), symbols_path, full: true, ..Default::default() }
+    pub fn new(roots: &[PathBuf]) -> Self {
+        Server { vfs: Vfs::load(roots), roots: roots.to_vec(), full: true, ..Default::default() }
     }
 
     /// `path` changed on disk or in the editor.
@@ -133,12 +134,6 @@ impl Server {
     pub fn update(&mut self) -> (Vec<(PathBuf, Vec<Diagnostic>)>, bool) {
         let mut touched = HashSet::new();
         let mut configs = Vec::new();
-        if let Some(path) = &self.symbols_path {
-            let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok();
-            if self.symbols.as_ref().map(|(t, _)| *t) != modified {
-                self.full = true;
-            }
-        }
         for path in std::mem::take(&mut self.dirty) {
             match ext(&path) {
                 "rs2" if !self.has_macros => {
@@ -150,6 +145,10 @@ impl Server {
                 "rs2" | "macro" => self.full = true,
                 _ => configs.push(path),
             }
+        }
+        // ponytail: rebuilds every table to compare (~17 ms on Content); per-table rebuilds if that shows in the slow log
+        if !self.full && configs.iter().any(|p| symbols::SOURCES.contains(&ext(p))) && symbols::tables(&self.vfs.files().collect::<Vec<_>>()) != self.symbols {
+            self.full = true;
         }
         if configs.iter().any(|p| ext(p) == "pack") {
             // the names that exist changed: every config value is checked again
@@ -225,8 +224,6 @@ impl Server {
         Job {
             files: self.vfs.files().map(|(p, t)| (p.to_path_buf(), t.to_owned())).collect(),
             roots: self.roots.clone(),
-            symbols_path: self.symbols_path.clone(),
-            symbols: self.symbols.take(),
             parses: std::mem::take(&mut self.parses),
         }
     }
@@ -276,14 +273,12 @@ impl Server {
 pub struct Job {
     files: Vec<(PathBuf, String)>,
     roots: Vec<PathBuf>,
-    symbols_path: Option<PathBuf>,
-    symbols: Option<(SystemTime, IndexMap<String, CompilerTypeInfo>)>,
     parses: HashMap<PathBuf, Parse>,
 }
 
 /// A full pass's results, for [`Server::install`].
 pub struct Done {
-    symbols: Option<(SystemTime, IndexMap<String, CompilerTypeInfo>)>,
+    symbols: IndexMap<String, CompilerTypeInfo>,
     parses: HashMap<PathBuf, Parse>,
     configs: ConfigIndex,
     state: Option<State>,
@@ -292,32 +287,12 @@ pub struct Done {
 }
 
 impl Job {
-    /// Loads `symbols.json` when the path is set and the file changed. `Err` is a
-    /// message for the user.
-    fn load_symbols(&mut self) -> Result<(), String> {
-        let Some(path) = &self.symbols_path else {
-            self.symbols = None;
-            return Err("RuneScript: set `runescript.symbolsPath` to the server's data/symbols.json (a dev-mode ares server writes it after every build; `ares-pack symbols` writes it once) to get type checking, hover and completion. Only syntax errors are reported until then.".into());
-        };
-        let modified = std::fs::metadata(path).and_then(|m| m.modified()).map_err(|e| format!("RuneScript: cannot read {}: {e}", path.display()))?;
-        if self.symbols.as_ref().is_some_and(|(t, _)| *t == modified) {
-            return Ok(());
-        }
-        let text = std::fs::read_to_string(path).map_err(|e| format!("RuneScript: cannot read {}: {e}", path.display()))?;
-        let tables = serde_json::from_str(&text).map_err(|e| format!("RuneScript: {} is not a symbols.json: {e}", path.display()))?;
-        self.symbols = Some((modified, tables));
-        Ok(())
-    }
-
     /// Parses only what changed since the last pass, then registers and type checks everything.
     pub fn run(mut self) -> Done {
         let mut warning = None;
-        if let Err(w) = self.load_symbols() {
-            self.symbols = None;
-            warning = Some(w);
-        }
         let files: Vec<(&Path, &str)> = self.files.iter().map(|(p, t)| (p.as_path(), t.as_str())).collect();
         let configs = ConfigIndex::build(&self.roots, &files);
+        let symbols = symbols::tables(&files);
         let has_macros = files.iter().any(|(p, _)| ext(p) == "macro");
 
         // ponytail: with macros every script is parsed (and expanded) by the compiler each pass, and there is no fast path.
@@ -345,47 +320,31 @@ impl Job {
         }
 
         let mut state = None;
-        if let Some((_, symbols)) = &self.symbols {
-            let mut symbols = symbols.clone();
-            // Interfaces and components added since the last `symbols.json` come from the workspace's `interface.pack`.
-            for (_, text) in files.iter().filter(|(p, _)| p.file_name().is_some_and(|f| f == "interface.pack")) {
-                for (id, n) in text.lines().filter_map(|l| l.split_once('=')) {
-                    let Ok(num) = id.parse::<i32>() else { continue };
-                    for t in ["interface", "component"] {
-                        let Some(table) = symbols.get_mut(t) else { continue };
-                        if !table.map.contains_key(id) {
-                            table.map.insert(id.to_owned(), n.trim_end().to_owned());
-                            table.max = table.max.max(num);
-                        }
+        let config = ares_compiler::Config { symbols: symbols.clone(), ..Default::default() };
+        let result = if has_macros {
+            ares_compiler::analyze(&config, &sources)
+        } else {
+            ares_compiler::runescript::compiler::new_compiler(&config).map_err(Into::into).and_then(|c| ares_compiler::analyze_parsed(c, parsed))
+        };
+        match result {
+            Ok(analysis) => {
+                let texts: HashMap<&Path, &str> = files.iter().copied().collect();
+                let mut script_diags: HashMap<PathBuf, Vec<Diagnostic>> = HashMap::new();
+                for (_, diags) in &analysis.diagnostics {
+                    for d in &diags.list {
+                        let path = PathBuf::from(&d.source.name);
+                        let Some(text) = texts.get(path.as_path()) else { continue };
+                        script_diags.entry(path).or_default().push(diagnostic(text, &d.source, d.kind, d.formatted()));
                     }
                 }
+                let index = Index::build(&analysis.files, &analysis.compiler.tables);
+                let file_pos = order.into_iter().enumerate().map(|(i, p)| (p, i)).collect();
+                state = Some(State { analysis, index, script_diags, file_pos });
             }
-            let config = ares_compiler::Config { symbols, ..Default::default() };
-            let result = if has_macros {
-                ares_compiler::analyze(&config, &sources)
-            } else {
-                ares_compiler::runescript::compiler::new_compiler(&config).map_err(Into::into).and_then(|c| ares_compiler::analyze_parsed(c, parsed))
-            };
-            match result {
-                Ok(analysis) => {
-                    let texts: HashMap<&Path, &str> = files.iter().copied().collect();
-                    let mut script_diags: HashMap<PathBuf, Vec<Diagnostic>> = HashMap::new();
-                    for (_, diags) in &analysis.diagnostics {
-                        for d in &diags.list {
-                            let path = PathBuf::from(&d.source.name);
-                            let Some(text) = texts.get(path.as_path()) else { continue };
-                            script_diags.entry(path).or_default().push(diagnostic(text, &d.source, d.kind, d.formatted()));
-                        }
-                    }
-                    let index = Index::build(&analysis.files, &analysis.compiler.tables);
-                    let file_pos = order.into_iter().enumerate().map(|(i, p)| (p, i)).collect();
-                    state = Some(State { analysis, index, script_diags, file_pos });
-                }
-                Err(e) => warning = Some(format!("RuneScript: analysis failed: {e}")),
-            }
+            Err(e) => warning = Some(format!("RuneScript: analysis failed: {e}")),
         }
         drop(files);
-        Done { symbols: self.symbols, parses: self.parses, configs, state, has_macros, warning }
+        Done { symbols, parses: self.parses, configs, state, has_macros, warning }
     }
 }
 

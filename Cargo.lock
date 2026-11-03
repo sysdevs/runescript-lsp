@@ -494,6 +494,7 @@ name = "runescript-lsp"
 version = "0.1.0"
 dependencies = [
  "ares-compiler",
+ "ares-shared",
  "crossbeam-channel",
  "indexmap",
  "lsp-server",

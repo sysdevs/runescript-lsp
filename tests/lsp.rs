@@ -1,5 +1,5 @@
-//! The features over a small fixture workspace (symbols from ares-compiler's
-//! 07-commands case), plus an env-gated run over the real Content.
+//! The features over a small fixture workspace (symbol tables built from its
+//! own packs and configs), plus env-gated runs over the real Content.
 
 use std::path::{Path, PathBuf};
 
@@ -11,8 +11,7 @@ fn fixture() -> PathBuf {
 }
 
 fn server() -> Server {
-    let symbols = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../ares-compiler/tests/fixtures/07-commands/symbols.json");
-    let mut s = Server::new(&[fixture()], Some(symbols));
+    let mut s = Server::new(&[fixture()]);
     let cycle = s.analyze();
     assert!(cycle.warning.is_none(), "{:?}", cycle.warning);
     s
@@ -37,8 +36,7 @@ fn targets(locs: &[Location]) -> Vec<(String, u32)> {
 
 #[test]
 fn clean_fixture_has_no_diagnostics() {
-    let symbols = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../ares-compiler/tests/fixtures/07-commands/symbols.json");
-    let mut s = Server::new(&[fixture()], Some(symbols));
+    let mut s = Server::new(&[fixture()]);
     let cycle = s.analyze();
     let all: Vec<_> = cycle.diagnostics.iter().flat_map(|(p, d)| d.iter().map(move |d| (p.clone(), d.message.clone()))).collect();
     assert!(all.is_empty(), "{all:?}");
@@ -137,23 +135,45 @@ fn broken_file_keeps_last_good_symbols() {
     assert!(cycle.diagnostics.iter().any(|(p, d)| p == &m && d.is_empty()), "cleared");
 }
 
+/// `RS2_CORPUS=../Content RS2_SYMBOLS=../content-golden/symbols.json cargo test --release symbols_match_golden`:
+/// the tables built from Content's text equal the ones ares-pack builds from its packed configs.
 #[test]
-fn missing_symbols_reports_syntax_only() {
-    let mut s = Server::new(&[fixture()], None);
-    let cycle = s.analyze();
-    assert!(cycle.warning.unwrap().contains("runescript.symbolsPath"));
-    assert!(cycle.diagnostics.is_empty());
+fn symbols_match_golden() {
+    let (Ok(corpus), Ok(symbols)) = (std::env::var("RS2_CORPUS"), std::env::var("RS2_SYMBOLS")) else {
+        eprintln!("symbols_match_golden skipped (set RS2_CORPUS and RS2_SYMBOLS)");
+        return;
+    };
+    let vfs = runescript_lsp::vfs::Vfs::load(&[PathBuf::from(corpus)]);
+    let t = std::time::Instant::now();
+    let got = runescript_lsp::symbols::tables(&vfs.files().collect::<Vec<_>>());
+    println!("tables in {:?}", t.elapsed());
+    let want: indexmap::IndexMap<String, ares_compiler::runescript::type_info::CompilerTypeInfo> =
+        serde_json::from_str(&std::fs::read_to_string(symbols).unwrap()).unwrap();
+    assert_eq!(got.keys().collect::<Vec<_>>(), want.keys().collect::<Vec<_>>());
+    for (k, w) in &want {
+        let g = &got[k];
+        assert_eq!(g.max, w.max, "{k}.max");
+        let fields = |t: &ares_compiler::runescript::type_info::CompilerTypeInfo| {
+            [("map", format!("{:?}", t.map)), ("vartype", format!("{:?}", t.vartype)), ("protect", format!("{:?}", t.protect)), ("require", format!("{:?}", t.require))]
+        };
+        let first = |a: &indexmap::IndexMap<String, String>, b: &indexmap::IndexMap<String, String>| {
+            a.iter().find(|(k, v)| b.get(*k) != Some(v)).map(|(k, v)| (k.clone(), v.clone(), b.get(k).cloned())).or_else(|| b.iter().find(|(k, _)| !a.contains_key(*k)).map(|(k, v)| (k.clone(), String::new(), Some(v.clone()))))
+        };
+        assert_eq!(first(&g.map, &w.map), None, "{k}.map: (id, got, golden)");
+        assert_eq!(first(&g.vartype, &w.vartype), None, "{k}.vartype: (id, got, golden)");
+        assert!(g == w, "table `{k}` differs: {:?}", fields(g).iter().zip(fields(w)).filter(|(a, b)| a.1 != b.1).map(|(a, _)| a.0).collect::<Vec<_>>());
+    }
 }
 
-/// `RS2_CORPUS=../Content RS2_SYMBOLS=../content-golden/symbols.json cargo test --release content_analysis -- --nocapture`
+/// `RS2_CORPUS=../Content cargo test --release content_analysis -- --nocapture`
 #[test]
 fn content_analysis() {
-    let (Ok(corpus), Ok(symbols)) = (std::env::var("RS2_CORPUS"), std::env::var("RS2_SYMBOLS")) else {
-        eprintln!("content_analysis skipped (set RS2_CORPUS and RS2_SYMBOLS)");
+    let Ok(corpus) = std::env::var("RS2_CORPUS") else {
+        eprintln!("content_analysis skipped (set RS2_CORPUS)");
         return;
     };
     let t = std::time::Instant::now();
-    let mut s = Server::new(&[PathBuf::from(corpus)], Some(PathBuf::from(symbols)));
+    let mut s = Server::new(&[PathBuf::from(corpus)]);
     let loaded = t.elapsed();
     let t = std::time::Instant::now();
     let cycle = s.analyze();
@@ -372,8 +392,8 @@ fn rename_config_through_values() {
     assert_eq!(got, [("items.obj".into(), 0), ("items.obj".into(), 6), ("main.rs2".into(), 5), ("obj.pack".into(), 0)]);
 }
 
-/// A throwaway workspace with one interface `test` (components layer0, com0, other, and fresh,
-/// which only the pack knows), its pack lines and a script using `test:com0`; symbols are 07-commands plus component/interface tables.
+/// A throwaway workspace with one interface `test` (components layer0, com0, other, and fresh),
+/// its pack lines and a script using `test:com0`.
 fn interface_workspace() -> (Server, PathBuf) {
     let dir = std::env::temp_dir().join(format!("rs-lsp-component-rename-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -385,21 +405,7 @@ fn interface_workspace() -> (Server, PathBuf) {
     write("scripts/test/interfaces/test.if", "[layer0]\ntype=layer\n\n[com0]\ntype=graphic\nlayer=layer0\noverlayer=layer0\n\n[other]\ntype=rect\nscript1op1=inv_count,test:com0,coins\n\n[fresh]\ntype=rect\n");
     write("scripts/test/scripts/test.rs2", "[if_button,test:com0]\nreturn;\n");
     write("pack/interface.pack", "0=test\n1=test:layer0\n2=test:com0\n3=test:other\n4=test:fresh\n");
-    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../ares-compiler/tests/fixtures/07-commands/symbols.json");
-    let mut symbols: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(base).unwrap()).unwrap();
-    let table = |names: &[(&str, &str)]| {
-        let mut t = symbols["obj"].clone();
-        t["max"] = serde_json::json!(names.len());
-        t["map"] = serde_json::Value::Object(names.iter().map(|(id, n)| (id.to_string(), serde_json::json!(n))).collect());
-        t
-    };
-    let component = table(&[("1", "test:layer0"), ("2", "test:com0"), ("3", "test:other")]);
-    let interface = table(&[("0", "test")]);
-    symbols["component"] = component;
-    symbols["interface"] = interface;
-    let symbols_path = dir.join("symbols.json");
-    std::fs::write(&symbols_path, serde_json::to_string(&symbols).unwrap()).unwrap();
-    let mut s = Server::new(&[dir.clone()], Some(symbols_path));
+    let mut s = Server::new(&[dir.clone()]);
     let cycle = s.analyze();
     assert!(cycle.warning.is_none(), "{:?}", cycle.warning);
     (s, dir.join("scripts/test/interfaces/test.if"))
@@ -453,7 +459,7 @@ fn component_rename() {
     let header = rename_edits(&s, &iface, Position { line: 3, character: 2 }, "pic");
     assert_eq!(rename_edits(&s, &iface, Position { line: 10, character: 24 }, "pic"), header);
     assert!(s.prepare_rename(&iface, Position { line: 4, character: 2 }).is_err(), "keys are not components");
-    // a component newer than symbols.json is known from interface.pack
+    // a component only the pack and the `.if` know
     assert_eq!(
         rename_edits(&s, &iface, Position { line: 12, character: 2 }, "new"),
         [("interface.pack".into(), 4, 2, "test:new".into()), ("test.if".into(), 12, 1, "new".into())]
@@ -504,16 +510,16 @@ fn header_edit_takes_a_full_pass() {
     assert!(s.update().1, "changed parameters reach other files: full pass");
 }
 
-/// `RS2_CORPUS=../Content RS2_SYMBOLS=../ares-gameserver/data/symbols.json cargo test --release content_recheck -- --nocapture`
+/// `RS2_CORPUS=../Content cargo test --release content_recheck -- --nocapture`
 #[test]
 fn content_recheck() {
-    let (Ok(corpus), Ok(symbols)) = (std::env::var("RS2_CORPUS"), std::env::var("RS2_SYMBOLS")) else {
-        eprintln!("content_recheck skipped (set RS2_CORPUS and RS2_SYMBOLS)");
+    let Ok(corpus) = std::env::var("RS2_CORPUS") else {
+        eprintln!("content_recheck skipped (set RS2_CORPUS)");
         return;
     };
     let corpus = PathBuf::from(corpus).canonicalize().unwrap();
     let file = corpus.join("scripts/quests/quest_legends/scripts/quest_legends.rs2");
-    let mut s = Server::new(&[corpus.clone()], Some(PathBuf::from(&symbols)));
+    let mut s = Server::new(&[corpus.clone()]);
     s.analyze();
     let text = s.vfs.text(&file).unwrap().to_owned();
     // a type error at the end of the first script's body
@@ -527,7 +533,7 @@ fn content_recheck() {
     println!("content: recheck of quest_legends.rs2 took {took:?}");
     assert!(!full);
     let fast = published(&diags, &file);
-    let mut reference = Server::new(&[corpus], Some(PathBuf::from(symbols)));
+    let mut reference = Server::new(&[corpus]);
     reference.vfs.open(file.clone(), bad);
     assert_eq!(published(&reference.analyze().diagnostics, &file), fast);
     assert_eq!(fast.len(), 1, "{fast:?}");
@@ -555,4 +561,26 @@ fn config_edit_rescans_one_file() {
     s.vfs.open(obj.clone(), good);
     s.changed(&obj);
     assert_eq!(published(&s.update().0, &obj), []);
+}
+
+#[test]
+fn symbol_edit_takes_a_full_pass() {
+    let mut s = server();
+    let varp = fixture().join("pack/varp.pack");
+    // the same names: no full pass
+    s.vfs.open(varp.clone(), "0=playtime
+".into());
+    s.changed(&varp);
+    assert!(!s.update().1);
+    // a new varp: the next full pass knows it
+    s.vfs.open(varp.clone(), "0=playtime
+1=score
+".into());
+    s.changed(&varp);
+    assert!(s.update().1);
+    let m = main_rs2();
+    s.vfs.open(m.clone(), std::fs::read_to_string(&m).unwrap().replace("%playtime", "%score"));
+    s.changed(&m);
+    let cycle = s.analyze();
+    assert_eq!(published(&cycle.diagnostics, &m), []);
 }

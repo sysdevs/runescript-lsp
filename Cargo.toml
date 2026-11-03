@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 ares-compiler = { path = "../ares-compiler" }
+ares-shared = { path = "../ares-shared" }
 crossbeam-channel = "0.5"
 indexmap = "2"
 lsp-server = "0.7"
