@@ -113,8 +113,10 @@ pub struct Cycle {
 }
 
 impl Server {
+    /// `roots` are the workspace folders; only their content trees are analyzed ([`vfs::content_roots`]).
     pub fn new(roots: &[PathBuf]) -> Self {
-        Server { vfs: Vfs::load(roots), roots: roots.to_vec(), full: true, ..Default::default() }
+        let roots = vfs::content_roots(roots);
+        Server { vfs: Vfs::load(&roots), roots, full: true, ..Default::default() }
     }
 
     /// `path` changed on disk or in the editor.

@@ -563,6 +563,51 @@ fn config_edit_rescans_one_file() {
     assert_eq!(published(&s.update().0, &obj), []);
 }
 
+/// A folder of repos (as when the editor opens the folder above Content): only
+/// `Content/` is analyzed, so a fixture's `.macro` does not turn every script edit
+/// into a full pass and a fixture's `.pack` does not rename Content's configs.
+#[test]
+fn parent_folder_analyzes_only_content() {
+    let dir = std::env::temp_dir().join(format!("rs-lsp-parent-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let write = |rel: &str, text: &str| {
+        let p = dir.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, text).unwrap();
+    };
+    write("Content/scripts/main.rs2", "[proc,main]
+mes(\"hi\");
+");
+    write("Content/scripts/engine.rs2", "[command,mes](string $text)
+");
+    write("Content/pack/obj.pack", "0=coins
+");
+    write("compiler/tests/fixture/scripts/defs.macro", "#define X 1
+");
+    write("compiler/tests/fixture/scripts/other.rs2", "[proc,main]
+return;
+");
+    write("compiler/tests/fixture/pack/obj.pack", "0=sword
+");
+    let mut s = Server::new(&[dir.clone()]);
+    assert!(s.vfs.files().all(|(p, _)| p.starts_with(dir.join("Content"))));
+    let cycle = s.analyze();
+    assert!(cycle.warning.is_none(), "{:?}", cycle.warning);
+    let main = dir.join("Content/scripts/main.rs2");
+    s.vfs.open(main.clone(), "[proc,main]
+mes(\"hello\");
+".into());
+    s.changed(&main);
+    assert!(!s.update().1, "a body edit takes the fast path");
+    // a file outside Content opened in the editor stays out
+    let other = dir.join("compiler/tests/fixture/scripts/other.rs2");
+    s.vfs.open(other.clone(), "[proc,main]
+return;
+".into());
+    assert!(s.vfs.text(&other).is_none());
+    assert_eq!(runescript_lsp::symbols::tables(&s.vfs.files().collect::<Vec<_>>())["obj"].map["0"], "coins");
+}
+
 #[test]
 fn symbol_edit_takes_a_full_pass() {
     let mut s = server();

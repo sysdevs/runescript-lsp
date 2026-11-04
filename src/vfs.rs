@@ -1,5 +1,6 @@
 //! The files the server analyzes: every script and config file under the
-//! workspace roots, read from disk, with open editor buffers laid over them.
+//! content roots ([`content_roots`]), read from disk, with open editor buffers
+//! laid over them.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -22,25 +23,53 @@ pub fn ext(path: &Path) -> &str {
     path.extension().and_then(|e| e.to_str()).unwrap_or("")
 }
 
-fn wanted(path: &Path) -> bool {
-    let e = ext(path);
-    e == "rs2" || e == "macro" || CONFIG_EXTS.contains(&e) || e == "pack"
+fn is_content(dir: &Path) -> bool {
+    dir.join("scripts").is_dir() && dir.join("pack").is_dir()
+}
+
+/// The folders to analyze: a workspace folder that is a content tree (`scripts/`
+/// and `pack/`) as itself, otherwise its content children (a folder of repos
+/// with `Content/` among them), otherwise itself. Test fixtures and other
+/// checkouts deeper down stay out of the analysis.
+pub fn content_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for r in roots {
+        if is_content(r) {
+            out.push(r.clone());
+            continue;
+        }
+        let mut children: Vec<PathBuf> = std::fs::read_dir(r).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| is_content(p)).collect();
+        children.sort();
+        if children.is_empty() {
+            out.push(r.clone());
+        }
+        out.extend(children);
+    }
+    out
 }
 
 #[derive(Default)]
 pub struct Vfs {
     disk: BTreeMap<PathBuf, Text>,
     open: HashMap<PathBuf, Text>,
+    /// Files outside these are ignored (none: everything is in scope).
+    roots: Vec<PathBuf>,
 }
 
 impl Vfs {
     /// Reads every wanted file under `roots`.
     pub fn load(roots: &[PathBuf]) -> Self {
-        let mut v = Vfs::default();
+        let mut v = Vfs { roots: roots.iter().map(|r| norm(r)).collect(), ..Default::default() };
         for r in roots {
             v.walk(r);
         }
         v
+    }
+
+    /// A script or config file under the roots.
+    fn wanted(&self, path: &Path) -> bool {
+        let e = ext(path);
+        (e == "rs2" || e == "macro" || CONFIG_EXTS.contains(&e) || e == "pack") && (self.roots.is_empty() || self.roots.iter().any(|r| path.starts_with(r)))
     }
 
     fn walk(&mut self, dir: &Path) {
@@ -51,7 +80,7 @@ impl Vfs {
                 if !SKIP_DIRS.iter().any(|s| e.file_name() == *s) {
                     self.walk(&p);
                 }
-            } else if wanted(&p) {
+            } else if self.wanted(&p) {
                 self.reload(&p);
             }
         }
@@ -60,7 +89,7 @@ impl Vfs {
     /// Re-reads one file from disk (or forgets it when it is gone).
     pub fn reload(&mut self, path: &Path) {
         let path = &norm(path);
-        if !wanted(path) {
+        if !self.wanted(path) {
             return;
         }
         match std::fs::read(path) {
@@ -75,12 +104,18 @@ impl Vfs {
     }
 
     pub fn open(&mut self, path: PathBuf, text: String) {
-        self.open.insert(norm(&path), Text::new(text));
+        let path = norm(&path);
+        if self.wanted(&path) {
+            self.open.insert(path, Text::new(text));
+        }
     }
 
     /// Applies an incremental edit to `path`'s buffer.
     pub fn edit(&mut self, path: &Path, range: lsp_types::Range, new: &str) {
         let path = norm(path);
+        if !self.wanted(&path) {
+            return;
+        }
         let base = || self.disk.get(&path).cloned().unwrap_or_default();
         let base = if self.open.contains_key(&path) { None } else { Some(base()) };
         self.open.entry(path).or_insert_with(|| base.unwrap()).edit(range, new);

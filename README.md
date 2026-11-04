@@ -20,7 +20,12 @@ extension.
 ## How it works
 
 The server reads every `.rs2`, `.macro`, `.pack` and config file under the
-workspace folders, and lays open editor buffers over them.
+content roots, and lays open editor buffers over them. A workspace folder with
+`scripts/` and `pack/` is a content root; otherwise its children that have
+both are (a folder of repos with `Content/` in it), and only if there are none
+is the folder itself. Test fixtures and other checkouts further down are left
+out: a stray `.macro` would otherwise make every script edit a full pass, and
+a fixture's `.pack` would rename Content's configs.
 
 - **Full pass:** parses and type-checks the whole workspace on a worker thread
   while requests are still answered from the previous result. It runs at
